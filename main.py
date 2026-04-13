@@ -1,36 +1,49 @@
-from pyrogram import Client
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
-API_ID = 21752358        # from my.telegram.org
-API_HASH = "fb46a136fed4a4de27ab057c7027fec3"
-BOT_TOKEN = "8641638446:AAHU1q4tSijiW1alAZSUhUcf9oucPPi1SlM"
+BOT_TOKEN = "8641638446:AAHU1q4tSijiW1alAZSUhUcf9oucPPi1SlM"       # from @BotFather
+CHANNEL_ID = "@chillflames"  # or numeric ID like -1001234567890
 
-CHANNEL_ID = "@yourchannelusername"  # or -100xxxx id
+async def post_to_channel():
+    bot = Bot(token=BOT_TOKEN)
 
-app = Client("button-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-
-@app.on_message()
-async def send_post(client, message):
-    # Only allow you (optional safety)
-    if message.from_user.id != 123456789:
-        return
-
-    keyboard = InlineKeyboardMarkup([
+    # Build colored inline buttons
+    keyboard = [
         [
-            InlineKeyboardButton("🟢 Buy Now", url="https://t.me/yourlink"),
-            InlineKeyboardButton("🔴 Cancel", callback_data="cancel")
+            InlineKeyboardButton(
+                text="✅ Join Now",
+                url="https://t.me/your_link",
+                style="success"      # GREEN
+            ),
+            InlineKeyboardButton(
+                text="🔗 Website",
+                url="https://yourwebsite.com",
+                style="primary"      # BLUE
+            ),
         ],
         [
-            InlineKeyboardButton("📩 Contact", url="https://t.me/yourusername")
+            InlineKeyboardButton(
+                text="❌ Unsubscribe",
+                callback_data="unsub",
+                style="danger"       # RED
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="More Info",    # no style = default gray
+                callback_data="info"
+            ),
         ]
-    ])
+    ]
 
-    await client.send_message(
+    markup = InlineKeyboardMarkup(keyboard)
+
+    await bot.send_message(
         chat_id=CHANNEL_ID,
-        text=message.text,
-        reply_markup=keyboard
+        text="👋 *Welcome to our channel!*\n\nChoose an option below:",
+        parse_mode="Markdown",
+        reply_markup=markup
     )
+    print("Posted successfully!")
 
-
-app.run()
+asyncio.run(post_to_channel())
