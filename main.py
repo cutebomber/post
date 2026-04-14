@@ -22,7 +22,7 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 #  CONFIGURATION  ← Edit these two lines
 # ──────────────────────────────────────────────
-BOT_TOKEN  = "8641638446:AAHU1q4tSijiW1alAZSUhUcf9oucPPi1SlM"       # from @BotFather
+BOT_TOKEN  = "8651990559:AAHk3DToBDJCgz57OJf88AtqcLLiS-S2myk"       # from @BotFather
 CHANNEL_ID = "@chillflames"    # e.g. "@mychannel" or -1001234567890
 # ──────────────────────────────────────────────
 
