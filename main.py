@@ -23,7 +23,7 @@ from telegram.ext import (
 #  CONFIGURATION  ← Edit these two lines
 # ──────────────────────────────────────────────
 BOT_TOKEN  = "8651990559:AAHk3DToBDJCgz57OJf88AtqcLLiS-S2myk"       # from @BotFather
-CHANNEL_ID = "@chillflames"    # e.g. "@mychannel" or -1001234567890
+CHANNEL_ID = "@fuuet"    # e.g. "@mychannel" or -1001234567890
 # ──────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
