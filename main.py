@@ -1,422 +1,462 @@
-"""
-Telegram Channel Post Bot
-- Posts rich messages with colored inline buttons to a channel
-- Supports premium custom emojis (via emoji entities)
-- Run: python bot.py
-"""
-
-import os
+import asyncio
 import logging
-import json
-import re
+from typing import Dict, List, Optional
+from datetime import datetime
+
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MessageEntity,
+    Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, ChatMember, Chat, MessageEntity
 )
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from telegram.constants import ParseMode
 
+# Enable logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ── Conversation states ──────────────────────────────────────────────────────
-(
-    MAIN_MENU,
-    ENTER_TEXT,
-    ENTER_BUTTONS,
-    CONFIRM_POST,
-    ENTER_CHANNEL,
-) = range(5)
+# Conversation states
+POST_TITLE, POST_CONTENT, POST_BUTTONS, BUTTON_EDIT, PREVIEW_POST = range(5)
 
-# ── In-memory draft store (per user) ────────────────────────────────────────
-drafts: dict[int, dict] = {}
+# Store temporary post data for each user
+user_post_data: Dict[int, Dict] = {}
 
-
-def get_draft(user_id: int) -> dict:
-    if user_id not in drafts:
-        drafts[user_id] = {"text": "", "entities": [], "buttons": [], "channel": ""}
-    return drafts[user_id]
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def build_keyboard(buttons: list[dict]) -> InlineKeyboardMarkup | None:
-    """
-    buttons: list of {"text": str, "url": str | None, "callback": str | None, "emoji_id": str | None}
-    Telegram doesn't support native button colors via Bot API — we simulate
-    color via emoji prefixes embedded in button text.
-    """
-    if not buttons:
-        return None
-
-    # Group into rows of up to 2
-    rows = []
-    for i in range(0, len(buttons), 2):
-        row = []
-        for btn in buttons[i : i + 2]:
-            label = btn["text"]
-            if btn.get("emoji_id"):
-                # Custom emoji in button text (premium feature)
-                # Telegram renders custom emoji in inline keyboard labels
-                label = f"{btn['emoji_id_char']}{label}" if btn.get("emoji_id_char") else label
-            if btn.get("url"):
-                row.append(InlineKeyboardButton(label, url=btn["url"]))
-            else:
-                cb = btn.get("callback", "noop")
-                row.append(InlineKeyboardButton(label, callback_data=cb))
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
-
-
-def parse_button_line(line: str) -> dict | None:
-    """
-    Syntax:
-      Button Text | https://url.com
-      Button Text | /callback_data
-      Button Text | https://url.com | 🎨 (custom emoji id)
-    """
-    parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 2:
-        return None
-    btn: dict = {"text": parts[0], "url": None, "callback": None, "emoji_id": None}
-    target = parts[1]
-    if target.startswith("http://") or target.startswith("https://"):
-        btn["url"] = target
-    else:
-        btn["callback"] = target.lstrip("/")
-    if len(parts) >= 3:
-        # Third part treated as custom emoji document_id or visible emoji
-        btn["emoji_id_char"] = parts[2]
-    return btn
-
-
-# ── Command: /start ──────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    get_draft(user_id)  # init
-    await show_main_menu(update, ctx)
-    return MAIN_MENU
-
-
-async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Write Post Text", callback_data="action_text")],
-        [InlineKeyboardButton("🔘 Add Buttons", callback_data="action_buttons")],
-        [InlineKeyboardButton("📢 Set Channel", callback_data="action_channel")],
-        [InlineKeyboardButton("👁 Preview", callback_data="action_preview")],
-        [InlineKeyboardButton("🚀 Post to Channel", callback_data="action_post")],
-        [InlineKeyboardButton("🗑 Clear Draft", callback_data="action_clear")],
-    ])
-    text = (
-        "📬 *Channel Post Composer*\n\n"
-        "Build a post with rich text and inline buttons\\.\n\n"
-        "Supports:\n"
-        "• Bold, italic, code, spoiler via MarkdownV2\n"
-        "• Custom premium emojis in text\n"
-        "• Colored buttons \\(emoji prefixes\\)\n"
-        "• URL and callback buttons\n\n"
-        "Choose an action:"
-    )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard
-        )
-    else:
+class TelegramPostBot:
+    def __init__(self, token: str, channel_username: str, admin_user_ids: List[int]):
+        """
+        Initialize the bot
+        
+        Args:
+            token: Telegram bot token
+            channel_username: Channel username (without @)
+            admin_user_ids: List of Telegram user IDs who are admins
+        """
+        self.token = token
+        self.channel_username = channel_username
+        self.admin_user_ids = admin_user_ids
+        self.application = None
+        
+    async def check_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Check if user is admin of the bot"""
+        user_id = update.effective_user.id
+        if user_id not in self.admin_user_ids:
+            await update.message.reply_text(
+                "❌ You are not authorized to use this bot.",
+                parse_mode=ParseMode.HTML
+            )
+            return False
+        return True
+    
+    async def check_channel_admin(self, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Check if bot is admin in the channel"""
+        try:
+            chat_member = await context.bot.get_chat_member(
+                chat_id=f"@{self.channel_username}",
+                user_id=context.bot.id
+            )
+            return chat_member.status in ['administrator', 'creator']
+        except Exception as e:
+            logger.error(f"Bot is not admin in channel: {e}")
+            return False
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start command handler"""
+        if not await self.check_admin(update, context):
+            return
+        
         await update.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard
+            "🎨 <b>Welcome to Advanced Post Creator Bot!</b>\n\n"
+            "I can help you create beautiful posts with colored inline buttons\n"
+            "and premium custom emojis for your channel.\n\n"
+            "<b>Commands:</b>\n"
+            "/newpost - Create a new post\n"
+            "/cancel - Cancel current operation\n"
+            "/help - Show this help message\n\n"
+            "<b>Features:</b>\n"
+            "• Colored inline buttons\n"
+            "• Premium custom emojis\n"
+            "• Rich text formatting\n"
+            "• Post preview before sending",
+            parse_mode=ParseMode.HTML
         )
-
-
-# ── Callback router ──────────────────────────────────────────────────────────
-
-async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "action_text":
-        await q.edit_message_text(
-            "✏️ *Enter your post text*\n\n"
-            "Use MarkdownV2 formatting:\n"
-            "`*bold*` \\| `_italic_` \\| `__underline__` \\| `~strikethrough~`\n"
-            "`||spoiler||` \\| `` `code` `` \\| `[link](url)`\n\n"
-            "For custom emojis paste them directly into the text \\(requires premium\\)\\.\n\n"
-            "Send your text now:",
-            parse_mode=ParseMode.MARKDOWN_V2,
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Help command handler"""
+        if not await self.check_admin(update, context):
+            return
+        
+        await update.message.reply_text(
+            "📖 <b>How to create a post:</b>\n\n"
+            "1️⃣ Use /newpost to start\n"
+            "2️⃣ Enter post title (with emojis if desired)\n"
+            "3️⃣ Enter post content with formatting\n"
+            "4️⃣ Add buttons (or skip)\n"
+            "5️⃣ Preview and send to channel\n\n"
+            "<b>Button Format:</b>\n"
+            "Use: <code>button_text|url|color</code>\n"
+            "Example: <code>Visit Website|https://example.com|blue</code>\n\n"
+            "<b>Available Colors:</b>\n"
+            "🔵 blue, 🟢 green, 🔴 red, 🟡 yellow, 🟣 purple\n\n"
+            "<b>Premium Emojis:</b>\n"
+            "Just paste premium emojis directly into text!\n\n"
+            "<b>Formatting:</b>\n"
+            "Use HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;a href='url'&gt;link&lt;/a&gt;",
+            parse_mode=ParseMode.HTML
         )
-        return ENTER_TEXT
-
-    elif data == "action_buttons":
-        await q.edit_message_text(
-            "🔘 *Add Inline Buttons*\n\n"
-            "Send one button per line in format:\n"
-            "`Button Label | https://example.com`\n"
-            "`Button Label | /callback_data`\n\n"
-            "Add emoji prefix for color effect:\n"
-            "`🟢 Join Now | https://t.me/yourchannel`\n"
-            "`🔴 Leave | /leave`\n"
-            "`🔵 Info | https://example.com`\n\n"
-            "Up to 2 buttons per row \\(just list them and they auto\\-pair\\)\\.\n\n"
-            "Send your buttons:",
-            parse_mode=ParseMode.MARKDOWN_V2,
+    
+    async def new_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start new post creation"""
+        if not await self.check_admin(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        user_post_data[user_id] = {
+            'title': None,
+            'content': None,
+            'buttons': []
+        }
+        
+        await update.message.reply_text(
+            "📝 <b>Create New Post</b>\n\n"
+            "Please send me the <b>post title</b>.\n"
+            "You can use:\n"
+            "• Regular emojis 🎉\n"
+            "• Premium custom emojis (if you have Telegram Premium)\n"
+            "• HTML formatting\n\n"
+            "Send /cancel to stop.",
+            parse_mode=ParseMode.HTML
         )
-        return ENTER_BUTTONS
-
-    elif data == "action_channel":
-        await q.edit_message_text(
-            "📢 *Set Target Channel*\n\n"
-            "Send the channel username or ID:\n"
-            "`@yourchannel` or `-1001234567890`\n\n"
-            "Make sure this bot is an *admin* in that channel with *Post Messages* permission\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+        
+        return POST_TITLE
+    
+    async def get_post_title(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle post title input"""
+        user_id = update.effective_user.id
+        title = update.message.text
+        
+        if title == '/cancel':
+            await self.cancel(update, context)
+            return ConversationHandler.END
+        
+        user_post_data[user_id]['title'] = title
+        
+        await update.message.reply_text(
+            "✍️ <b>Great! Now send me the post content.</b>\n\n"
+            "<b>Supported formatting:</b>\n"
+            "• &lt;b&gt;bold&lt;/b&gt;\n"
+            "• &lt;i&gt;italic&lt;/i&gt;\n"
+            "• &lt;code&gt;code&lt;/code&gt;\n"
+            "• &lt;a href='URL'&gt;link&lt;/a&gt;\n"
+            "• Custom emojis (premium supported)\n\n"
+            "Send your content:",
+            parse_mode=ParseMode.HTML
         )
-        return ENTER_CHANNEL
-
-    elif data == "action_preview":
-        return await show_preview(update, ctx)
-
-    elif data == "action_post":
-        return await do_post(update, ctx)
-
-    elif data == "action_clear":
-        drafts[update.effective_user.id] = {"text": "", "entities": [], "buttons": [], "channel": ""}
-        await q.answer("Draft cleared!", show_alert=True)
-        await show_main_menu(update, ctx)
-        return MAIN_MENU
-
-    elif data == "back_menu":
-        await show_main_menu(update, ctx)
-        return MAIN_MENU
-
-    else:
-        await q.answer("Button pressed: " + data)
-        return MAIN_MENU
-
-
-# ── Enter text state ─────────────────────────────────────────────────────────
-
-async def receive_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    draft = get_draft(user_id)
-    msg = update.message
-
-    draft["text"] = msg.text or msg.caption or ""
-    # Preserve entities for custom emoji support
-    entities = msg.entities or msg.caption_entities or []
-    draft["entities"] = [e.to_dict() for e in entities]
-
-    await msg.reply_text(
-        f"✅ Text saved\\! \\({len(draft['text'])} chars\\)",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
-        ]),
-    )
-    return MAIN_MENU
-
-
-# ── Enter buttons state ──────────────────────────────────────────────────────
-
-async def receive_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    draft = get_draft(user_id)
-    lines = update.message.text.strip().splitlines()
-
-    parsed = []
-    errors = []
-    for i, line in enumerate(lines, 1):
-        line = line.strip()
-        if not line:
-            continue
-        btn = parse_button_line(line)
-        if btn:
-            parsed.append(btn)
+        
+        return POST_CONTENT
+    
+    async def get_post_content(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle post content input"""
+        user_id = update.effective_user.id
+        content = update.message.text
+        
+        if content == '/cancel':
+            await self.cancel(update, context)
+            return ConversationHandler.END
+        
+        user_post_data[user_id]['content'] = content
+        
+        await update.message.reply_text(
+            "🔘 <b>Now let's add buttons!</b>\n\n"
+            "Send buttons in this format (one per line):\n"
+            "<code>button_text|url|color</code>\n\n"
+            "<b>Available colors:</b>\n"
+            "blue, green, red, yellow, purple\n\n"
+            "Examples:\n"
+            "<code>Visit Site|https://example.com|blue</code>\n"
+            "<code>Buy Now|https://store.com|green</code>\n"
+            "<code>Learn More|https://docs.com|purple</code>\n\n"
+            "Send <b>done</b> when finished, or <b>skip</b> for no buttons.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        return POST_BUTTONS
+    
+    def get_color_code(self, color: str) -> str:
+        """Convert color name to Telegram button color code"""
+        colors = {
+            'blue': 'primary',
+            'green': 'success',
+            'red': 'danger',
+            'yellow': 'warning',
+            'purple': 'secondary'
+        }
+        return colors.get(color.lower(), 'primary')
+    
+    async def add_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle button addition"""
+        user_id = update.effective_user.id
+        text = update.message.text
+        
+        if text.lower() == 'done':
+            return await self.show_preview(update, context)
+        
+        if text.lower() == 'skip':
+            user_post_data[user_id]['buttons'] = []
+            return await self.show_preview(update, context)
+        
+        # Parse button
+        try:
+            parts = text.split('|')
+            if len(parts) != 3:
+                await update.message.reply_text(
+                    "❌ Invalid format! Use: <code>text|url|color</code>\n"
+                    "Example: <code>Click Me|https://example.com|blue</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return POST_BUTTONS
+            
+            button_text, url, color = parts
+            color_code = self.get_color_code(color)
+            
+            user_post_data[user_id]['buttons'].append({
+                'text': button_text.strip(),
+                'url': url.strip(),
+                'color': color_code
+            })
+            
+            await update.message.reply_text(
+                f"✅ Button added! Current buttons: {len(user_post_data[user_id]['buttons'])}\n"
+                f"Send another button, 'done', or 'skip' to finish.",
+                parse_mode=ParseMode.HTML
+            )
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Error: {str(e)}\nPlease use correct format.",
+                parse_mode=ParseMode.HTML
+            )
+        
+        return POST_BUTTONS
+    
+    async def show_preview(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show post preview before sending"""
+        user_id = update.effective_user.id
+        post_data = user_post_data.get(user_id)
+        
+        if not post_data:
+            await update.message.reply_text("❌ No post data found. Start with /newpost")
+            return ConversationHandler.END
+        
+        # Build post content
+        content = f"<b>{post_data['title']}</b>\n\n{post_data['content']}"
+        
+        # Create buttons
+        keyboard = []
+        for button in post_data['buttons']:
+            keyboard.append([InlineKeyboardButton(
+                text=button['text'],
+                url=button['url']
+            )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        # Send preview
+        preview_message = await update.message.reply_text(
+            f"<b>📱 POST PREVIEW</b>\n\n{content}\n\n"
+            f"<b>Buttons:</b> {len(post_data['buttons'])}\n"
+            f"<b>Total characters:</b> {len(content)}\n\n"
+            f"✅ Ready to send? Reply with 'send' to post to channel, "
+            f"or 'edit' to modify, or 'cancel' to abort.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+        
+        return PREVIEW_POST
+    
+    async def handle_preview_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle preview response (send/edit/cancel)"""
+        user_id = update.effective_user.id
+        response = update.message.text.lower()
+        
+        if response == 'send':
+            await self.send_to_channel(update, context)
+            return ConversationHandler.END
+        
+        elif response == 'edit':
+            await update.message.reply_text(
+                "✏️ What would you like to edit?\n"
+                "Send 'title', 'content', or 'buttons'",
+                parse_mode=ParseMode.HTML
+            )
+            return BUTTON_EDIT
+        
+        elif response == 'cancel':
+            await self.cancel(update, context)
+            return ConversationHandler.END
+        
         else:
-            errors.append(f"Line {i}: `{line}`")
-
-    draft["buttons"] = parsed
-
-    msg_parts = [f"✅ *{len(parsed)} button(s) saved\\!*"]
-    if errors:
-        msg_parts.append("⚠️ Could not parse:\n" + "\n".join(errors))
-
-    await update.message.reply_text(
-        "\n\n".join(msg_parts),
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
-        ]),
-    )
-    return MAIN_MENU
-
-
-# ── Enter channel state ──────────────────────────────────────────────────────
-
-async def receive_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    draft = get_draft(user_id)
-    draft["channel"] = update.message.text.strip()
-
-    await update.message.reply_text(
-        f"✅ Channel set to `{draft['channel']}`",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
-        ]),
-    )
-    return MAIN_MENU
-
-
-# ── Preview ──────────────────────────────────────────────────────────────────
-
-async def show_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    user_id = update.effective_user.id
-    draft = get_draft(user_id)
-
-    if not draft["text"]:
-        await q.answer("No text set yet!", show_alert=True)
-        return MAIN_MENU
-
-    keyboard = build_keyboard(draft["buttons"])
-    caption_parts = []
-    if draft["channel"]:
-        caption_parts.append(f"📢 Channel: {draft['channel']}")
-    caption_parts.append(f"🔘 Buttons: {len(draft['buttons'])}")
-
-    try:
-        await q.message.reply_text(
-            "👁 *Preview:*\n" + "\n".join(caption_parts),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            await update.message.reply_text(
+                "Please reply with 'send', 'edit', or 'cancel'",
+                parse_mode=ParseMode.HTML
+            )
+            return PREVIEW_POST
+    
+    async def edit_post_part(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle editing different parts of the post"""
+        user_id = update.effective_user.id
+        edit_part = update.message.text.lower()
+        
+        if edit_part == 'title':
+            await update.message.reply_text("Send new title:")
+            return POST_TITLE
+        elif edit_part == 'content':
+            await update.message.reply_text("Send new content:")
+            return POST_CONTENT
+        elif edit_part == 'buttons':
+            user_post_data[user_id]['buttons'] = []
+            await update.message.reply_text("Send new buttons (or 'skip'):")
+            return POST_BUTTONS
+        else:
+            await update.message.reply_text("Invalid option. Send 'title', 'content', or 'buttons'")
+            return BUTTON_EDIT
+    
+    async def send_to_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send the final post to channel"""
+        user_id = update.effective_user.id
+        post_data = user_post_data.get(user_id)
+        
+        if not post_data:
+            await update.message.reply_text("❌ No post data found.")
+            return
+        
+        # Check bot is admin in channel
+        if not await self.check_channel_admin(context):
+            await update.message.reply_text(
+                f"❌ Bot is not an admin in @{self.channel_username}\n"
+                f"Please add bot as admin first!",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Build final post
+        content = f"<b>{post_data['title']}</b>\n\n{post_data['content']}"
+        
+        # Create buttons
+        keyboard = []
+        for button in post_data['buttons']:
+            keyboard.append([InlineKeyboardButton(
+                text=button['text'],
+                url=button['url']
+            )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        try:
+            # Send to channel
+            sent_message = await context.bot.send_message(
+                chat_id=f"@{self.channel_username}",
+                text=content,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            
+            await update.message.reply_text(
+                f"✅ <b>Post published successfully!</b>\n\n"
+                f"📊 <b>Stats:</b>\n"
+                f"• Title: {post_data['title'][:50]}...\n"
+                f"• Buttons: {len(post_data['buttons'])}\n"
+                f"• Message ID: {sent_message.message_id}\n\n"
+                f"🔗 <a href='https://t.me/{self.channel_username}/{sent_message.message_id}'>View Post</a>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            
+            # Clear stored data
+            del user_post_data[user_id]
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Failed to send post: {str(e)}\n\n"
+                f"Make sure:\n"
+                f"• Bot is admin in @{self.channel_username}\n"
+                f"• Channel exists and is public\n"
+                f"• Content doesn't violate Telegram rules",
+                parse_mode=ParseMode.HTML
+            )
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel current operation"""
+        user_id = update.effective_user.id
+        if user_id in user_post_data:
+            del user_post_data[user_id]
+        
+        await update.message.reply_text(
+            "❌ Operation cancelled.",
+            parse_mode=ParseMode.HTML
         )
-        # Send the actual preview with entities
-        entities = [MessageEntity.de_json(e, ctx.bot) for e in draft.get("entities", [])]
-        await ctx.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=draft["text"],
-            entities=entities if entities else None,
-            reply_markup=keyboard,
+        return ConversationHandler.END
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Update {update} caused error {context.error}")
+        
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ An error occurred. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+    
+    def run(self):
+        """Run the bot"""
+        # Create application
+        self.application = Application.builder().token(self.token).build()
+        
+        # Create conversation handler
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('newpost', self.new_post)],
+            states={
+                POST_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_post_title)],
+                POST_CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_post_content)],
+                POST_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_buttons)],
+                BUTTON_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_post_part)],
+                PREVIEW_POST: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_preview_response)],
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel)],
         )
-    except Exception as e:
-        await q.message.reply_text(f"⚠️ Preview error: {e}")
+        
+        # Add handlers
+        self.application.add_handler(conv_handler)
+        self.application.add_handler(CommandHandler('start', self.start))
+        self.application.add_handler(CommandHandler('help', self.help_command))
+        self.application.add_error_handler(self.error_handler)
+        
+        # Start bot
+        print(f"🤖 Bot started! Add @{self.application.bot.username} as admin to @{self.channel_username}")
+        print("Press Ctrl+C to stop...")
+        
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    await q.message.reply_text(
-        "How does it look?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 Post It!", callback_data="action_post")],
-            [InlineKeyboardButton("✏️ Edit", callback_data="back_menu")],
-        ]),
-    )
-    return MAIN_MENU
-
-
-# ── Post ─────────────────────────────────────────────────────────────────────
-
-async def do_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    user_id = update.effective_user.id
-    draft = get_draft(user_id)
-
-    if not draft["text"]:
-        await q.answer("Write some text first!", show_alert=True)
-        return MAIN_MENU
-    if not draft["channel"]:
-        await q.answer("Set a channel first!", show_alert=True)
-        return MAIN_MENU
-
-    keyboard = build_keyboard(draft["buttons"])
-    entities = [MessageEntity.de_json(e, ctx.bot) for e in draft.get("entities", [])]
-
-    try:
-        sent = await ctx.bot.send_message(
-            chat_id=draft["channel"],
-            text=draft["text"],
-            entities=entities if entities else None,
-            reply_markup=keyboard,
-        )
-        await q.edit_message_text(
-            f"✅ *Posted successfully\\!*\n\nMessage ID: `{sent.message_id}`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📬 New Post", callback_data="action_clear")],
-            ]),
-        )
-    except Exception as e:
-        await q.edit_message_text(
-            f"❌ *Failed to post:*\n`{e}`\n\nMake sure the bot is admin in the channel\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back", callback_data="back_menu")]
-            ]),
-        )
-    return MAIN_MENU
-
-
-# ── Fallback ─────────────────────────────────────────────────────────────────
-
-async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Use /start to open the composer.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📬 Open Composer", callback_data="back_menu")]
-        ]),
-    )
-    return MAIN_MENU
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
-
-def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Set the BOT_TOKEN environment variable")
-
-    app = Application.builder().token(token).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
-        states={
-            MAIN_MENU: [
-                CallbackQueryHandler(menu_callback),
-            ],
-            ENTER_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-                CallbackQueryHandler(menu_callback, pattern="back_menu"),
-            ],
-            ENTER_BUTTONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_buttons),
-                CallbackQueryHandler(menu_callback, pattern="back_menu"),
-            ],
-            ENTER_CHANNEL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel),
-                CallbackQueryHandler(menu_callback, pattern="back_menu"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", cmd_start),
-            MessageHandler(filters.ALL, fallback),
-        ],
-        per_message=False,
-    )
-
-    app.add_handler(conv)
-    logger.info("Bot started. Press Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
-
+# Configuration
+BOT_TOKEN = "8651990559:AAHk3DToBDJCgz57OJf88AtqcLLiS-S2myk"  # Replace with your bot token
+CHANNEL_USERNAME = "@laveiuus"  # Replace with channel username (without @)
+ADMIN_USER_IDS = [1899208318]  # Replace with your Telegram user IDs
 
 if __name__ == "__main__":
-    main()
+    # Create and run bot
+    bot = TelegramPostBot(
+        token=BOT_TOKEN,
+        channel_username=CHANNEL_USERNAME,
+        admin_user_ids=ADMIN_USER_IDS
+    )
+    
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped!")
+    except Exception as e:
+        print(f"❌ Error: {e}")
